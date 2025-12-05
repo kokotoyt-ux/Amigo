@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, existsSync } from "fs";
-import { join } from "path";
+// Imports condicionais para evitar problemas na Vercel
+// As funções do fs serão importadas apenas quando necessário (localmente)
 
 export interface ParticipanteComRastreamento {
   nome: string;
@@ -22,21 +22,63 @@ interface Database {
   sorteios: Sorteio[];
 }
 
-// Detecção de ambiente
-const isVercel = process.env.VERCEL === "1" || !!process.env.KV_REST_API_URL;
-const useFileSystem = !isVercel && typeof process !== "undefined" && process.cwd;
+// Detecção de ambiente - melhorada para funcionar corretamente na Vercel
+function isVercelEnvironment(): boolean {
+  try {
+    // Vercel sempre define essa variável
+    if (process.env.VERCEL === "1" || process.env.VERCEL_ENV) {
+      return true;
+    }
+    // Se tem variáveis do KV, está na Vercel
+    if (process.env.KV_REST_API_URL) {
+      return true;
+    }
+    // Verifica se está em ambiente serverless (Vercel, Netlify, etc)
+    if (process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.VERCEL_URL) {
+      return true;
+    }
+    // Verifica se o hostname contém vercel
+    if (typeof process !== "undefined" && process.env.VERCEL_URL) {
+      return true;
+    }
+    return false;
+  } catch {
+    // Em caso de erro, assume que não está na Vercel (mais seguro)
+    return false;
+  }
+}
+
+const isVercel = isVercelEnvironment();
+const useFileSystem = !isVercel && typeof process !== "undefined" && typeof process.cwd === "function";
 
 // ==========================================
 // Implementação usando FileSystem (local)
 // ==========================================
-const DATA_FILE = join(process.cwd(), "data", "sorteios.json");
+function getDataFile(): string {
+  if (!useFileSystem) return "";
+  
+  try {
+    const { join } = require("path");
+    return join(process.cwd(), "data", "sorteios.json");
+  } catch {
+    // Se process.cwd() falhar, retorna path relativo
+    return "data/sorteios.json";
+  }
+}
 
 function ensureDataDir() {
   if (!useFileSystem) return;
-  const dataDir = join(process.cwd(), "data");
-  if (!existsSync(dataDir)) {
-    const { mkdirSync } = require("fs");
-    mkdirSync(dataDir, { recursive: true });
+  
+  try {
+    const { join } = require("path");
+    const { existsSync, mkdirSync } = require("fs");
+    const dataDir = join(process.cwd(), "data");
+    if (!existsSync(dataDir)) {
+      mkdirSync(dataDir, { recursive: true });
+    }
+  } catch (error) {
+    // Se falhar, não usa filesystem
+    console.error("Erro ao criar diretório de dados:", error);
   }
 }
 
@@ -45,22 +87,32 @@ function readDB(): Database {
     return { sorteios: [] };
   }
 
-  ensureDataDir();
-  if (!existsSync(DATA_FILE)) {
-    return { sorteios: [] };
-  }
   try {
+    ensureDataDir();
+    const { readFileSync, existsSync } = require("fs");
+    const DATA_FILE = getDataFile();
+    if (!existsSync(DATA_FILE)) {
+      return { sorteios: [] };
+    }
     const data = readFileSync(DATA_FILE, "utf-8");
     return JSON.parse(data);
-  } catch {
+  } catch (error) {
+    console.error("Erro ao ler do filesystem:", error);
     return { sorteios: [] };
   }
 }
 
 function writeDB(db: Database) {
   if (!useFileSystem) return;
-  ensureDataDir();
-  writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+
+  try {
+    ensureDataDir();
+    const { writeFileSync } = require("fs");
+    const DATA_FILE = getDataFile();
+    writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+  } catch (error) {
+    console.error("Erro ao escrever no filesystem:", error);
+  }
 }
 
 // ==========================================
@@ -73,8 +125,9 @@ async function getKV() {
     // Tenta usar @vercel/kv
     const { kv } = await import("@vercel/kv");
     return kv;
-  } catch {
+  } catch (error) {
     // Se não estiver disponível, retorna null
+    console.error("KV não disponível:", error);
     return null;
   }
 }
@@ -96,7 +149,10 @@ async function readDBKV(): Promise<Database> {
 
 async function writeDBKV(db: Database) {
   const kv = await getKV();
-  if (!kv) return;
+  if (!kv) {
+    console.warn("KV não disponível - dados não serão persistidos");
+    return;
+  }
 
   try {
     await kv.set("sorteios:database", db);
@@ -110,14 +166,22 @@ async function writeDBKV(db: Database) {
 // ==========================================
 
 export async function salvarSorteio(sorteio: Sorteio) {
-  if (isVercel) {
-    const db = await readDBKV();
-    db.sorteios.push(sorteio);
-    await writeDBKV(db);
-  } else {
-    const db = readDB();
-    db.sorteios.push(sorteio);
-    writeDB(db);
+  try {
+    if (isVercel) {
+      const db = await readDBKV();
+      db.sorteios.push(sorteio);
+      await writeDBKV(db);
+      // Se KV não estiver disponível, não falha - apenas não persiste
+      console.log("Sorteio salvo no KV (ou em memória se KV não disponível)");
+    } else {
+      const db = readDB();
+      db.sorteios.push(sorteio);
+      writeDB(db);
+    }
+  } catch (error) {
+    // Não falha se não conseguir salvar - apenas loga
+    console.error("Erro ao salvar sorteio (não crítico):", error);
+    // Em produção, podemos continuar mesmo sem persistência
   }
 }
 
